@@ -34,14 +34,25 @@ const el = {
   resultClose: document.getElementById("result-close"),
   optProportional: document.getElementById("opt-proportional"),
   optSound:    document.getElementById("opt-sound"),
+  spinMessage: document.getElementById("spin-message"),
   startOverlay: document.getElementById("start-overlay"),
   startBtn:    document.getElementById("start-btn"),
+  openLiveBtn: document.getElementById("open-live"),
+  liveOverlay: document.getElementById("live-overlay"),
+  liveQuestion: document.getElementById("live-question"),
+  liveQr:      document.getElementById("live-qr"),
+  liveUrl:     document.getElementById("live-url"),
+  liveFactorMode: document.getElementById("live-factor-mode"),
+  liveIdeas:   document.getElementById("live-ideas"),
+  liveCancelBtn: document.getElementById("live-cancel"),
+  liveFinishBtn: document.getElementById("live-finish"),
 };
 
 /* ---- C. Zustand der App ---- */
 let isSpinning = false;       // verhindert Doppel-Drehen
 let currentRotation = 0;      // aktuelle Raddrehung in Grad (summiert sich auf)
 let segments = [];            // zuletzt gezeichnete Segmente (für die Auslosung)
+let spinMessageTimer = null;  // blendet die Fehlermeldung automatisch wieder aus
 
 /* =====================================================================
    D. ANTWORT-ZEILEN
@@ -175,6 +186,22 @@ function pickWinnerIndex(answers) {
   return answers.length - 1; // Sicherheitsnetz
 }
 
+/* Zeigt eine Fehlermeldung im Design der App (statt Browser-alert)
+   und lässt den DREHEN-Button kurz wackeln, um Aufmerksamkeit zu lenken. */
+function showSpinMessage(text) {
+  el.spinMessage.textContent = text;
+  el.spinMessage.hidden = false;
+  el.spin.classList.remove("shake");
+  void el.spin.offsetWidth; // erzwingt Neustart der Animation
+  el.spin.classList.add("shake");
+  clearTimeout(spinMessageTimer);
+  spinMessageTimer = setTimeout(hideSpinMessage, 4500);
+}
+function hideSpinMessage() {
+  el.spinMessage.hidden = true;
+  clearTimeout(spinMessageTimer);
+}
+
 /* =====================================================================
    G. DREHEN
    ===================================================================== */
@@ -182,9 +209,10 @@ function spin() {
   if (isSpinning) return;
   const answers = readAnswers();
   if (answers.length < 2) {
-    alert("Bitte mindestens zwei Antworten eingeben.");
+    showSpinMessage("Bitte mindestens zwei Antworten eingeben – sonst gibt es nichts auszulosen.");
     return;
   }
+  hideSpinMessage(); // alte Meldung verschwindet, sobald es weitergeht
 
   isSpinning = true;
   el.spin.disabled = true;
@@ -224,7 +252,8 @@ function spin() {
 function startTicking(startRotation, totalTravel) {
   const duration = 8000;
   const t0 = performance.now();
-  let lastPinPassed = 0;
+  let lastFlapPassed = 0;   // zählt jeden Stift (visuelles Zucken)
+  let lastClackPassed = 0;  // zählt nur die Antwort-Grenzen (Geräusch)
 
   function frame(now) {
     const elapsed = now - t0;
@@ -233,12 +262,20 @@ function startTicking(startRotation, totalTravel) {
     const eased = 1 - Math.pow(1 - progress, 3);
     const rotated = eased * totalTravel; // wie weit das Rad schon gedreht hat
 
-    // Wie viele Antwort-Grenzen wurden seit Start überquert?
+    // Visuell: Zeiger zuckt bei JEDEM goldenen Stift (wirkt durchgängig echt)
+    const degPerPin = 360 / Math.max(pinCount, 1);
+    const flapsPassed = Math.floor(rotated / degPerPin);
+    if (flapsPassed > lastFlapPassed) {
+      lastFlapPassed = flapsPassed;
+      flapOnce();
+    }
+
+    // Hörbar: Klack-Geräusch nur an den Antwort-Grenzen (ruhigerer Rhythmus)
     const degPerClack = 360 / Math.max(clackCount, 1);
-    const pinsPassed = Math.floor(rotated / degPerClack);
-    if (pinsPassed > lastPinPassed) {
-      lastPinPassed = pinsPassed;
-      tickOnce();
+    const clacksPassed = Math.floor(rotated / degPerClack);
+    if (clacksPassed > lastClackPassed) {
+      lastClackPassed = clacksPassed;
+      if (el.optSound.checked) clack();
     }
 
     if (progress < 1 && isSpinning) requestAnimationFrame(frame);
@@ -246,10 +283,8 @@ function startTicking(startRotation, totalTravel) {
   requestAnimationFrame(frame);
 }
 
-/* Ein einzelnes Klack: kurzer harter Ton + Flapper schlägt aus */
-function tickOnce() {
-  if (el.optSound.checked) clack();
-  // Flapper zucken lassen (Animation kurz neu starten)
+/* Lässt den Zeiger einmal kurz ausschlagen (ohne Ton) */
+function flapOnce() {
   el.flapper.classList.remove("tick");
   void el.flapper.offsetWidth; // erzwingt Neustart der CSS-Animation
   el.flapper.classList.add("tick");
@@ -681,8 +716,165 @@ function buildPins(count) {
 }
 
 /* =====================================================================
+   K. LIVE-ABSTIMMUNG PER QR-CODE (Firebase)
+   ---------------------------------------------------------------------
+   Ein "Sitzungs"-Datensatz in Firebase verbindet das Gastgeber-Gerät mit
+   beliebig vielen Teilnehmenden-Handys: jede Idee und jede Stimme landet
+   live in diesem einen Datensatz, den alle gerade geöffneten Seiten
+   (Gastgeber + Teilnehmende) gleichzeitig beobachten.
+   ===================================================================== */
+let liveSessionId = null;
+let liveSessionRef = null;
+
+/* Kurze, gut lesbare Zufalls-Kennung (ohne verwechselbare Zeichen wie 0/O, 1/I) */
+function randomSessionId(len = 6) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let id = "";
+  for (let i = 0; i < len; i++) id += chars[Math.floor(Math.random() * chars.length)];
+  return id;
+}
+
+/* Baut die Teilnehmen-URL relativ zur aktuellen Seite, egal wo gehostet */
+function buildVoteUrl(sessionId) {
+  const base = window.location.href.replace(/index\.html?($|[?#])/i, "$1");
+  const folder = base.slice(0, base.lastIndexOf("/") + 1);
+  return folder + "vote.html?session=" + sessionId;
+}
+
+/* Startet eine neue Live-Sitzung: legt sie in Firebase an, zeigt den
+   QR-Code und hört ab sofort live auf neue Ideen/Stimmen. */
+function openLiveVoting() {
+  if (typeof firebase === "undefined" || !firebase.apps || !firebase.apps.length) {
+    showSpinMessage("Firebase ist nicht eingerichtet – siehe firebase-config.js.");
+    return;
+  }
+
+  const question = el.question.value.trim() || "Worüber stimmen wir ab?";
+  liveSessionId = randomSessionId();
+  liveSessionRef = firebase.database().ref("sessions/" + liveSessionId);
+
+  // Bereits eingetragene Antworten als Startvorschläge übernehmen,
+  // damit niemand bei null anfangen muss.
+  const seedAnswers = readAnswers();
+  const ideasSeed = {};
+  seedAnswers.forEach(a => {
+    const key = liveSessionRef.child("ideas").push().key;
+    ideasSeed[key] = { text: a.text, votes: 0 };
+  });
+
+  liveSessionRef.set({
+    question,
+    factorMode: el.liveFactorMode.checked,
+    ideas: ideasSeed,
+  });
+
+  const voteUrl = buildVoteUrl(liveSessionId);
+  el.liveQr.src = "https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=" + encodeURIComponent(voteUrl);
+  el.liveUrl.textContent = voteUrl;
+  el.liveQuestion.textContent = question;
+  el.liveOverlay.hidden = false;
+
+  // Live-Listener: läuft bei jeder Änderung erneut (neue Idee, neue Stimme)
+  liveSessionRef.child("ideas").on("value", snapshot => {
+    renderLiveIdeas(snapshot.val() || {});
+  });
+}
+
+/* Zeichnet die aktuelle Ideen-Liste im Gastgeber-Dashboard, nach
+   Stimmen sortiert, damit die Spannung sichtbar steigt. */
+function renderLiveIdeas(ideasObj) {
+  const entries = Object.entries(ideasObj);
+  el.liveIdeas.innerHTML = "";
+
+  if (entries.length === 0) {
+    el.liveIdeas.innerHTML = '<p class="live-empty">Noch keine Ideen eingereicht …</p>';
+    return;
+  }
+
+  entries.sort((a, b) => (b[1].votes || 0) - (a[1].votes || 0));
+  entries.forEach(([key, idea]) => {
+    const row = document.createElement("div");
+    row.className = "live-idea-row pulse";
+    const votes = idea.votes || 0;
+    row.innerHTML = `
+      <span class="live-idea-text">${escapeHtml(idea.text || "")}</span>
+      <span class="live-idea-votes">${votes} ${votes === 1 ? "Stimme" : "Stimmen"}</span>
+    `;
+    el.liveIdeas.appendChild(row);
+  });
+}
+
+/* Beendet die Live-Sitzung. Bei applyResults=true werden die zuletzt
+   bekannten Ideen+Stimmen als neue Antwortliste samt Faktoren übernommen. */
+function closeLiveVoting(applyResults) {
+  if (!liveSessionRef) { el.liveOverlay.hidden = true; return; }
+
+  liveSessionRef.child("ideas").off("value");
+
+  if (applyResults) {
+    liveSessionRef.child("ideas").once("value").then(snapshot => {
+      applyLiveResultsToWheel(snapshot.val() || {});
+      liveSessionRef.remove(); // aufräumen, damit nichts in der Datenbank bleibt
+    });
+  } else {
+    liveSessionRef.remove();
+  }
+
+  el.liveOverlay.hidden = true;
+  liveSessionId = null;
+  liveSessionRef = null;
+}
+
+/* Übernimmt die eingesammelten Ideen als neue Antwortliste. Je nach
+   Schalter wird die Stimmenzahl zum Abstimmungsfaktor – oder jede
+   Idee bekommt bewusst die gleiche Gewinnchance (Faktor 1). */
+function applyLiveResultsToWheel(ideasObj) {
+  const entries = Object.values(ideasObj).filter(i => (i.text || "").trim() !== "");
+  if (entries.length === 0) {
+    showSpinMessage("Es wurden keine Ideen eingereicht.");
+    return;
+  }
+
+  const factorMode = el.liveFactorMode.checked;
+  el.answerList.innerHTML = "";
+  entries.forEach(idea => {
+    const factor = factorMode ? Math.max(1, idea.votes || 0) : 1;
+    el.answerList.appendChild(makeAnswerRow(idea.text, factor));
+  });
+  drawWheel();
+}
+
+/* =====================================================================
    J. START
    ===================================================================== */
+/* Zeichnet das farbige Rad im Start-Logo (Regenbogen-Segmente) */
+function buildLogoWheel() {
+  const g = document.getElementById("logo-wheel");
+  if (!g) return;
+  const cx = 300, cy = 230, r = 210;
+  const count = 24;
+  // Regenbogen-Farbtöne rundherum
+  for (let i = 0; i < count; i++) {
+    const a1 = (i / count) * 2 * Math.PI - Math.PI / 2;
+    const a2 = ((i + 1) / count) * 2 * Math.PI - Math.PI / 2;
+    const x1 = cx + r * Math.cos(a1), y1 = cy + r * Math.sin(a1);
+    const x2 = cx + r * Math.cos(a2), y2 = cy + r * Math.sin(a2);
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 0 1 ${x2} ${y2} Z`);
+    path.setAttribute("fill", `hsl(${(i / count) * 360}, 75%, 55%)`);
+    path.setAttribute("stroke", "#ffffff");
+    path.setAttribute("stroke-width", "1.5");
+    g.appendChild(path);
+  }
+  // dünner goldener Außenring
+  const ring = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  ring.setAttribute("cx", cx); ring.setAttribute("cy", cy); ring.setAttribute("r", r);
+  ring.setAttribute("fill", "none");
+  ring.setAttribute("stroke", "#b8912e");
+  ring.setAttribute("stroke-width", "6");
+  g.appendChild(ring);
+}
+
 function init() {
   // Beispielhafte Startdaten, damit man sofort etwas sieht
   el.question.value = "Was essen wir heute Abend?";
@@ -694,6 +886,7 @@ function init() {
   ].forEach(([t, f]) => el.answerList.appendChild(makeAnswerRow(t, f)));
 
   buildBulbs(24);
+  buildLogoWheel(); // farbiges Rad im Start-Logo zeichnen
   drawWheel();
 
   // Knöpfe verbinden
@@ -719,6 +912,11 @@ function init() {
   });
 
   el.question.addEventListener("input", () => {}); // Frage frei wählbar
+
+  // Live-Abstimmung per QR-Code
+  el.openLiveBtn.addEventListener("click", openLiveVoting);
+  el.liveCancelBtn.addEventListener("click", () => closeLiveVoting(false));
+  el.liveFinishBtn.addEventListener("click", () => closeLiveVoting(true));
 }
 
 init();
